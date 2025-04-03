@@ -498,6 +498,7 @@ class CachedWheelsCommand(_bdist_wheel):
             print("Raw wheel path", wheel_path)
             os.rename(wheel_filename, wheel_path)
         except (urllib.error.HTTPError, urllib.error.URLError):
+            assert False, f"building from source is not allowed. check network: {wheel_url}"
             print("Precompiled wheel not found. Building from source...")
             # If the wheel could not be downloaded, build from source
             super().run()

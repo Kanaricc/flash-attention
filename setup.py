@@ -482,8 +482,14 @@ class CachedWheelsCommand(_bdist_wheel):
 
         wheel_url, wheel_filename = get_wheel_url()
         print("Guessing wheel URL: ", wheel_url)
+
+        local_filename = os.getenv("FLASH_LOCAL_WHEEL_PATH", None)
+        
         try:
-            urllib.request.urlretrieve(wheel_url, wheel_filename)
+            if local_filename is None:
+                urllib.request.urlretrieve(wheel_url, wheel_filename)
+            else:
+                wheel_filename=local_filename
 
             # Make the archive
             # Lifted from the root wheel processing command

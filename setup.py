@@ -502,7 +502,8 @@ class CachedWheelsCommand(_bdist_wheel):
 
             wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
             print("Raw wheel path", wheel_path)
-            os.rename(wheel_filename, wheel_path)
+            import shutil
+            shutil.move(wheel_filename, wheel_path)
         except (urllib.error.HTTPError, urllib.error.URLError):
             assert False, f"building from source is not allowed. check network: {wheel_url}"
             print("Precompiled wheel not found. Building from source...")

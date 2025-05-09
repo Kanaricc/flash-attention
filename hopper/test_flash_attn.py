@@ -63,7 +63,7 @@ COMPILED_HDIMS = (
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("V_colmajor", [False, True])
 @pytest.mark.parametrize("V_colmajor", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -120,7 +120,8 @@ def test_flash_attn_output(
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    for dv in dv_vals:
+    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -153,6 +154,7 @@ def test_flash_attn_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -165,6 +167,7 @@ def test_flash_attn_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -197,6 +200,7 @@ def test_flash_attn_output(
                 qv=qv,
                 q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
+                attention_chunk=attention_chunk,
                 softcap=softcap,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits
@@ -211,64 +215,68 @@ def test_flash_attn_output(
             # of a Pytorch implementation.
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor and not has_qv:
-        g = torch.randn_like(out)
-        do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-        # import flash_attn_3_cuda
-        # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flash_attn_3_cuda.bwd(
-        #     g,
-        #     q,
-        #     k,
-        #     v,
-        #     out,
-        #     lse,
-        #     None,
-        #     None,
-        #     None,
-        #     d ** (-0.5),
-        #     causal,
-        #     window_size[0], window_size[1],
-        #     softcap,
-        #     deterministic,
-        #     0,  # sm_margin
-        # )
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-        # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
-        # assert (softmax_d - do_o).abs().max().item() <= 1e-5
-        # assert dq_accum.abs().max().item() == 0.0
+        if (
+            not DISABLE_BACKWARD 
+            and dtype != torch.float8_e4m3fn 
+            and not V_colmajor 
+            and not has_qv
+            and not dv > 256
+            and not attention_chunk != 0
+        ):
+            g = torch.randn_like(out)
+            do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
+            # import flash_attn_3_cuda
+            # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flash_attn_3_cuda.bwd(
+            #     g,
+            #     q,
+            #     k,
+            #     v,
+            #     out,
+            #     lse,
+            #     None,
+            #     None,
+            #     None,
+            #     d ** (-0.5),
+            #     causal,
+            #     window_size[0], window_size[1],
+            #     softcap,
+            #     deterministic,
+            #     0,  # sm_margin
+            # )
+            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
+            # assert (softmax_d - do_o).abs().max().item() <= 1e-5
+            # assert dq_accum.abs().max().item() == 0.0
 
-        # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
-        # P = torch.softmax(qk, -1)
-        # dP = P * (dS - do_o.transpose(1, 2).unsqueeze(1))
-        # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
-        # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
-        # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
+            # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
+            # P = torch.softmax(qk, -1)
+            # dP = P * (dS - do_o.transpose(1, 2).unsqueeze(1))
+            # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
+            # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
+            # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
 
-        # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-        dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
-        dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
-        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
-        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
-        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
-        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
-        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
-        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
-        # breakpoint()
-
-
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor and not has_qv:
-        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
-        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
-        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
+            # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+            print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+            print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+            print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+            print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+            print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+            print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+            print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+            print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+            print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+            print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+            print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+            # breakpoint()
+            dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+            assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
+            dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+            assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
+            dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+            assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -339,7 +347,8 @@ def test_flash_attn_varlen_output(
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    for dv in dv_vals:
+    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k and not DISABLE_LOCAL else [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -416,6 +425,7 @@ def test_flash_attn_varlen_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap
         )
         out_pt, attn_pt = attention_ref(
@@ -428,6 +438,7 @@ def test_flash_attn_varlen_output(
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -463,6 +474,7 @@ def test_flash_attn_varlen_output(
                 q_descale=q_descale,
                 k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
+                attention_chunk=attention_chunk,
                 softcap=softcap,
             )
             out = output_pad_fn(out_unpad)
@@ -479,81 +491,85 @@ def test_flash_attn_varlen_output(
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
 
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv:
-        g_unpad = torch.randn_like(out_unpad)
-        do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
-        # import flash_attn_3_cuda
-        # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
-        #     g_unpad,
-        #     q_unpad,
-        #     k_unpad,
-        #     v_unpad,
-        #     out_unpad,
-        #     lse,
-        #     None,
-        #     None,
-        #     None,
-        #     cu_seqlens_q,
-        #     cu_seqlens_k,
-        #     None, None,
-        #     max_seqlen_q,
-        #     max_seqlen_k,
-        #     d ** (-0.5),
-        #     causal,
-        #     window_size[0], window_size[1],
-        #     softcap,
-        #     deterministic,
-        #     0,  # sm_margin
-        # )
-        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), g_unpad)
-        dq = dq_pad_fn(dq_unpad)
-        dk = dk_pad_fn(dk_unpad)
-        dv = dk_pad_fn(dv_unpad)
-        if key_unused_mask is not None:
-            k_zero_masking = rearrange(key_unused_mask, "b s -> b s 1 1")
-            dk.masked_fill_(k_zero_masking, 0.0)
-            dv.masked_fill_(k_zero_masking, 0.0)
-        if query_unused_mask is not None:
-            dq.masked_fill_(q_zero_masking, 0.0)
-        # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
-        # assert (softmax_d - do_o).abs().max().item() <= 1e-5
-        # assert dq_accum.abs().max().item() == 0.0
-        g = output_pad_fn(g_unpad)
+        if (
+            not DISABLE_BACKWARD 
+            and dtype != torch.float8_e4m3fn 
+            and not has_qv
+            and not dv > 256
+            and not attention_chunk != 0
+        ):
+            g_unpad = torch.randn_like(out_unpad)
+            do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
+            # import flash_attn_3_cuda
+            # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
+            #     g_unpad,
+            #     q_unpad,
+            #     k_unpad,
+            #     v_unpad,
+            #     out_unpad,
+            #     lse,
+            #     None,
+            #     None,
+            #     None,
+            #     cu_seqlens_q,
+            #     cu_seqlens_k,
+            #     None, None,
+            #     max_seqlen_q,
+            #     max_seqlen_k,
+            #     d ** (-0.5),
+            #     causal,
+            #     window_size[0], window_size[1],
+            #     softcap,
+            #     deterministic,
+            #     0,  # sm_margin
+            # )
+            dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), g_unpad)
+            dq = dq_pad_fn(dq_unpad)
+            dk = dk_pad_fn(dk_unpad)
+            dv = dk_pad_fn(dv_unpad)
+            if key_unused_mask is not None:
+                k_zero_masking = rearrange(key_unused_mask, "b s -> b s 1 1")
+                dk.masked_fill_(k_zero_masking, 0.0)
+                dv.masked_fill_(k_zero_masking, 0.0)
+            if query_unused_mask is not None:
+                dq.masked_fill_(q_zero_masking, 0.0)
+            # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
+            # assert (softmax_d - do_o).abs().max().item() <= 1e-5
+            # assert dq_accum.abs().max().item() == 0.0
+            g = output_pad_fn(g_unpad)
 
-        # qk = torch.einsum('bthd,bshd->bhts', q / (d ** 0.5), k).float()
-        # qk = torch.masked_fill(qk, rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
-        # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
-        # P = torch.softmax(qk, -1)
-        # dP = P * (dS - (g.float() * out.float()).sum(-1).transpose(1, 2).unsqueeze(-1))
-        # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
-        # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
-        # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
+            # qk = torch.einsum('bthd,bshd->bhts', q / (d ** 0.5), k).float()
+            # qk = torch.masked_fill(qk, rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+            # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
+            # P = torch.softmax(qk, -1)
+            # dP = P * (dS - (g.float() * out.float()).sum(-1).transpose(1, 2).unsqueeze(-1))
+            # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
+            # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
+            # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
 
 
-        # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-        dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
-        dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
-        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
-        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
-        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
-        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
-        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
-        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
-        # breakpoint()
-
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv:
-        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
-        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
-        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
-        assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
+            # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+            print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+            print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+            print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+            print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+            print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+            print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+            print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+            print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+            print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+            print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+            print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+            # breakpoint()
+            dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+            assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
+            dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+            assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
+            dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+            assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -587,7 +603,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -650,7 +666,8 @@ def test_flash_attn_kvcache(
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    for dv in dv_vals:
+    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if (causal or local) and not DISABLE_LOCAL else [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         has_qv = d == 64 and dv >= 256
         q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
         if has_qv:
@@ -798,6 +815,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             key_leftpad=cache_leftpad,
         )
         out_pt, _ = attention_ref(
@@ -809,6 +827,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            attention_chunk=attention_chunk,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
@@ -835,11 +854,11 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
-                    batch_size, seqlen_q, seqlen_k, nheads, nheads_k, d,
+                    batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
                     cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
                     max_seqlen_k_new=seqlen_new, page_size=page_size,
-                    causal=causal, window_size=window_size,
+                    causal=causal, window_size=window_size, attention_chunk=attention_chunk,
                     num_splits=num_splits
                 )
             else:
@@ -871,6 +890,7 @@ def test_flash_attn_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    attention_chunk=attention_chunk,
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
